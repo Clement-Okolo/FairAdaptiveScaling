@@ -15,8 +15,11 @@ from sklearn.metrics import *
 from sklearn.model_selection import KFold
 from sklearn.utils import *
 
+# import sys
+# sys.path.append('.')
+
 import sys
-sys.path.append('.')
+sys.path.append('/medailab/medailab/clement/FairAdaptiveScaling')
 
 from src.modules import *
 from src.data_handler import *
@@ -33,6 +36,8 @@ from src.models_3d import *
 import models_vit
 from models_vit import NativeScalerWithGradNormCount, adjust_learning_rate, param_groups_lrd, interpolate_pos_embed
 from timm.models.layers import trunc_normal_
+import timm
+import types
 
 class Dataset_Info(NamedTuple):
     beta: float = 0.9999
@@ -42,7 +47,8 @@ class Dataset_Info(NamedTuple):
     no_of_classes: int = 2
     no_of_attr: int = 3
 
-device = torch.device('cuda:5' if torch.cuda.is_available() else 'cpu')
+# CUDA_VISIBLE_DEVICES (set in the .sh) exposes a single GPU to each process, so always use the first visible one
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
@@ -99,6 +105,13 @@ parser.add_argument('--shape_transform',
 parser.add_argument('--pretrained_3d',
                         default='i3d',
                         type=str)
+
+# Fair Adaptive Scaling (FAS) args
+parser.add_argument('--fair_scaling_coef', default=0.5, type=float,
+                    help='trade-off between individual loss and group weight in Fair_Loss_Scaler')
+parser.add_argument('--fair_scaling_group_weights', nargs='+', type=float, required=True,
+                    help='initial (learnable) weight per group of the chosen attribute')
+
 # parser.add_argument('--optimizer', type=str, required=True,
 #                     choices=['sgd', 'adam', 'adamw', 'adagrad', 'rmsprop', 'adadelta', 'adamax', 'asgd'],
 #                     help='Name of the optimizer (e.g., sgd, adam)')
@@ -139,11 +152,11 @@ def train(model, criterion, optimizer, scaler, train_dataset_loader, epoch, tota
     global device
 
     model.train()
-    
+
     loss_batch = []
     top1_accuracy_batch = []
     top5_accuracy_batch = []
-    
+
     preds = []
     gts = []
     attrs = []
@@ -158,21 +171,22 @@ def train(model, criterion, optimizer, scaler, train_dataset_loader, epoch, tota
             tmp_lr = adjust_learning_rate(optimizer, i / len(train_dataset_loader) + epoch, args)
             if i == 0:
                 print(f"lr: {tmp_lr}")
-        
+
         with torch.cuda.amp.autocast():
             input = input.to(device)
             target = target.to(device)
 
             pred = model(input) # .squeeze(1)
 
+            # criterion uses reduction='none' -> per-sample losses, which Fair_Loss_Scaler reweights by group
             if pred.shape[1] == 1:
                 pred = pred.squeeze(1)
                 loss = criterion(pred, target)
-                loss = loss_scaler(loss, attr=attr[attr_index])
+                loss = loss_scaler(loss, attr=attr[attr_index].to(device))
                 pred_prob = torch.sigmoid(pred.detach())
             elif pred.shape[1] > 1:
                 loss = criterion(pred, target.long())
-                loss = loss_scaler(loss, attr=attr[attr_index])
+                loss = loss_scaler(loss, attr=attr[attr_index].to(device))
                 pred_prob = F.softmax(pred.detach(), dim=1)
 
             preds.append(pred_prob.detach().cpu().numpy())
@@ -181,12 +195,12 @@ def train(model, criterion, optimizer, scaler, train_dataset_loader, epoch, tota
             attrs.append(attr.detach().cpu().numpy())
 
         loss_batch.append(loss.item())
-        
+
         if num_classes == 2:
             top1_accuracy = accuracy(pred_prob.detach().cpu().numpy(), target.detach().cpu().numpy(), topk=(1,))
         elif num_classes > 2:
             top1_accuracy = accuracy(pred_prob, target, topk=(1,))
-        
+
         top1_accuracy_batch.append(top1_accuracy)
 
         if args.model_type == 'ViT-B':
@@ -204,12 +218,12 @@ def train(model, criterion, optimizer, scaler, train_dataset_loader, epoch, tota
     preds = np.concatenate(preds, axis=0)
     gts = np.concatenate(gts, axis=0)
     attrs = np.concatenate(attrs, axis=1).astype(int)
-    
+
 #     idx = [i for i in range(len(preds)) if not np.isnan(preds[i])]
 #     preds = preds[idx]
 #     gts = gts[idx]
 #     attrs = attrs[:,idx]
-    
+
     cur_auc = compute_auc(preds, gts, num_classes=num_classes)
     # acc = np.mean(top1_accuracy_batch)
     if num_classes == 2:
@@ -225,13 +239,13 @@ def train(model, criterion, optimizer, scaler, train_dataset_loader, epoch, tota
     t1 = time.time()
 
     return np.mean(loss_batch), acc, cur_auc, preds, gts, attrs
-    
+
 
 def validation(model, criterion, optimizer, validation_dataset_loader, epoch, result_dir=None, dataset_info=None, num_classes=2):
     global device
 
     model.eval()
-    
+
     loss_batch = []
     top1_accuracy_batch = []
     top5_accuracy_batch = []
@@ -248,12 +262,12 @@ def validation(model, criterion, optimizer, validation_dataset_loader, epoch, re
         for i, (input, target, attr) in enumerate(validation_dataset_loader):
             input = input.to(device)
             target = target.to(device)
-            
+
             pred = model(input) # .squeeze(1)
 
             if pred.shape[1] == 1:
                 pred = pred.squeeze(1)
-                loss = criterion(pred, target)
+                loss = criterion(pred, target).mean()
                 pred_prob = torch.sigmoid(pred.detach())
             elif pred.shape[1] > 1:
                 loss = criterion(pred, target.long()).mean()
@@ -263,7 +277,7 @@ def validation(model, criterion, optimizer, validation_dataset_loader, epoch, re
             gts.append(target.detach().cpu().numpy())
             attr = torch.vstack(attr)
             attrs.append(attr.detach().cpu().numpy())
-            
+
 
             loss_batch.append(loss.item())
 
@@ -271,21 +285,21 @@ def validation(model, criterion, optimizer, validation_dataset_loader, epoch, re
                 top1_accuracy = accuracy(pred_prob.detach().cpu().numpy(), target.detach().cpu().numpy(), topk=(1,))
             elif num_classes > 2:
                 top1_accuracy = accuracy(pred_prob, target, topk=(1,))
-        
+
             top1_accuracy_batch.append(top1_accuracy)
-        
+
     loss = np.mean(loss_batch)
 
     preds = np.concatenate(preds, axis=0)
     gts = np.concatenate(gts, axis=0)
     attrs = np.concatenate(attrs, axis=1).astype(int)
-    
+
     #preds = np.nan_to_num(preds, 0)
 #     idx = [i for i in range(len(preds)) if not np.isnan(preds[i])]
 #     preds = preds[idx]
 #     gts = gts[idx]
 #     attrs = attrs[:,idx]
-    
+
     cur_auc = compute_auc(preds, gts, num_classes=num_classes)
 
     if num_classes == 2:
@@ -315,11 +329,11 @@ if __name__ == '__main__':
     if args.model_type == 'vit' or args.model_type == 'swin' or args.model_type == 'ViT-B':
         args.image_size = 224
 
-    
+
     train_transform = Transform3D(mul='random') if args.shape_transform else Transform3D()
     eval_transform = Transform3D(mul='0.5') if args.shape_transform else Transform3D()
-    
-    
+
+
     train_havo_dataset = Harvard_DR_Fairness(os.path.join(args.data_dir, 'train'), modality_type=args.modality_types, task=args.task, resolution=args.image_size, attribute_type=args.attribute_type, needBalance=args.need_balance, transform=train_transform, dataset_proportion=args.dataset_proportion)
     val_havo_dataset = Harvard_DR_Fairness(os.path.join(args.data_dir, 'val'), modality_type=args.modality_types, task=args.task, resolution=args.image_size, transform=eval_transform, attribute_type=args.attribute_type)
     test_havo_dataset = Harvard_DR_Fairness(os.path.join(args.data_dir, 'test'), modality_type=args.modality_types, task=args.task, resolution=args.image_size, transform=eval_transform, attribute_type=args.attribute_type)
@@ -333,7 +347,7 @@ if __name__ == '__main__':
     train_dataset_loader = torch.utils.data.DataLoader(
         train_havo_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, drop_last=True)
-    
+
     validation_dataset_loader = torch.utils.data.DataLoader(
         val_havo_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, drop_last=False)
@@ -342,9 +356,9 @@ if __name__ == '__main__':
         test_havo_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, drop_last=False)
 
-    
+
     print(len(train_dataset_loader))
-    
+
     samples_per_attr = get_num_by_group_(train_dataset_loader)
     logger.log(f'group information:')
     logger.log(samples_per_attr)
@@ -370,7 +384,7 @@ if __name__ == '__main__':
             esauc_head_str += ', '.join([f'esauc_attr{i}' for i in range(len(samples_per_attr))]) + ', '
 
             group_disparity_head_str += ', '.join([f'std_group_disparity_attr{i}, max_group_disparity_attr{i}' for i in range(len(samples_per_attr))]) + ', '
-            
+
             with open(best_global_perf_file, 'w') as f:
                 f.write(f'epoch, acc, {esacc_head_str} auc, {esauc_head_str} {auc_head_str} {dpd_head_str} {eod_head_str} {group_disparity_head_str} path\n')
 
@@ -378,16 +392,17 @@ if __name__ == '__main__':
         out_dim = 1
         criterion = nn.MSELoss()
         predictor_head = nn.Identity()
-    elif args.task == 'cls': 
+    elif args.task == 'cls':
         out_dim = 1
+        # reduction='none': Fair_Loss_Scaler needs per-sample losses to reweight them by group
         if args.num_classes == 2:
             out_dim = 1
-            criterion = nn.BCEWithLogitsLoss()
+            criterion = nn.BCEWithLogitsLoss(reduction='none')
         elif args.num_classes > 2:
             out_dim = args.num_classes
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(reduction='none')
         predictor_head = nn.Sigmoid()
-    elif args.task == 'tds': 
+    elif args.task == 'tds':
         out_dim = 52
         criterion = nn.MSELoss()
         predictor_head = nn.Identity()
@@ -442,11 +457,11 @@ if __name__ == '__main__':
                         checkpoint_path = "/scratch/mok232/Fairness_in_Eye_Disease_Screening/MODELHUB/vit-b_CXR_0.5M_mae.pth"
                     elif args.vit_weights == 'mae_color_fundus':
                         checkpoint_path = "/scratch/mok232/Fairness_in_Eye_Disease_Screening/MODELHUB/RETFound_cfp_weights.pth"
-                    
+
                     checkpoint = torch.load(checkpoint_path, map_location='cpu')
                     print("Load pre-trained checkpoint from: %s" % checkpoint_path)
                     checkpoint_model = checkpoint['model']
-                
+
                 state_dict = model.state_dict()
                 for k in ['head.weight', 'head.bias']:
                     if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
@@ -469,7 +484,7 @@ if __name__ == '__main__':
         elif args.vit_weights == 'dinov2_registers':
             model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg')
             model.head = torch.nn.Linear(in_features=768, out_features=out_dim, bias=True)
-        
+
         # manually initialize fc layer
         trunc_normal_(model.head.weight, std=2e-5)
 
@@ -478,12 +493,12 @@ if __name__ == '__main__':
             no_weight_decay_list = model.no_weight_decay()
         elif args.vit_weights in ['dinov2', 'dinov2_registers']:
             no_weight_decay_list = {'pos_embed', 'dist_token', 'cls_token', 'mask_token', 'register_tokens'} # add mask_token, register_tokens for DINOv2
-        
+
         param_groups = param_groups_lrd(model, args.weight_decay,
             no_weight_decay_list=no_weight_decay_list,
             layer_decay=args.layer_decay
         )
-    
+
         optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
         scaler = NativeScalerWithGradNormCount()
 
@@ -494,8 +509,8 @@ if __name__ == '__main__':
 
 #         in_dim = 3
 #         model = create_model(model_type=args.model_type, in_dim=in_dim, out_dim=out_dim)
-        
-        
+
+
         if args.modality_types == 'ilm' or args.modality_types == 'rnflt':
             in_dim = 1
             model = create_model(model_type=args.model_type, in_dim=in_dim, out_dim=out_dim)
@@ -522,6 +537,16 @@ if __name__ == '__main__':
                 model = ConvNeXt_Base(in_channels=1, num_classes=1)
             elif args.model_type == 'unet':
                 model = UNet(in_channels=1, num_classes=1)
+            elif args.model_type in ['efficientnet', 'resnet']:
+                model = create_model(model_type=args.model_type, in_dim=1, out_dim=out_dim) # use the pretrained weights from module.py
+            elif args.model_type == 'mobilenet':
+                model = create_model(model_type='mobilenet', in_dim=1, out_dim=out_dim) # use the pretrained weights from module.py
+                model.forward = types.MethodType(mobilenet_forward_3d, model)
+            elif args.model_type == 'densenet':
+                model = create_model(model_type='densenet', in_dim=1, out_dim=out_dim) # use the pretrained weights from module.py
+                model.forward = types.MethodType(densenet_forward_3d, model)
+            elif args.model_type == 'vgg':
+                model = create_model(model_type='vgg', in_dim=1, out_dim=out_dim) # use the pretrained weights from module.py
             # ----------------------
             else:
                 raise NotImplementedError
@@ -540,12 +565,12 @@ if __name__ == '__main__':
                 else:
                     model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=None))
                     print('using Conv3d model')
+            if args.model_type == 'vgg':
+                model.avgpool = nn.AdaptiveAvgPool3d((1, 7, 7))
         elif args.modality_types == 'rnflt+ilm':
             in_dim = 2
             model = OphBackbone(model_type=args.model_type, in_dim=in_dim, coef=args.fuse_coef)
-        
-        
-        
+
 
         optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.0, 0.1), weight_decay=args.weight_decay)
         #
@@ -557,14 +582,15 @@ if __name__ == '__main__':
         # raise Exception('not implemented')
 
     model = model.to(device)
-    
+
     loss_scaler = Fair_Loss_Scaler(fair_scaling_group_weights=args.fair_scaling_group_weights, fair_scaling_coef=args.fair_scaling_coef)
     loss_scaler = loss_scaler.to(device)
-    
+    logger.log(loss_scaler)
+
     scaler = torch.cuda.amp.GradScaler()
 
     optimizer = AdamW(list(model.parameters()) + list(loss_scaler.parameters()), lr=args.lr, betas=(0.0, 0.1), weight_decay=args.weight_decay)
-    
+
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
 
     start_epoch = 0
@@ -578,12 +604,17 @@ if __name__ == '__main__':
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    
+
+
     attribute_type_map_to_index = {'race': 0, 'gender': 1, 'hispanic': 2, 'maritalstatus': 3, 'language': 4, 'genderrace': 5, 'genderethnicity': 6}
     attribute_type_map_to_num = {'race': 3, 'gender': 2, 'hispanic': 2, 'maritalstatus': 5, 'language': 3, 'genderrace': 5, 'genderethnicity': 4}
     attribute_index = attribute_type_map_to_index[args.attribute_type]
-    
+
+    # every group of the chosen attribute needs its own weight, otherwise Fair_Loss_Scaler indexes out of range
+    if len(args.fair_scaling_group_weights) < attribute_type_map_to_num[args.attribute_type]:
+        raise ValueError(f'--fair_scaling_group_weights needs at least {attribute_type_map_to_num[args.attribute_type]} values for '
+                         f'attribute "{args.attribute_type}", got {len(args.fair_scaling_group_weights)}')
+
     total_iteration = len(train_havo_dataset)//args.batch_size
 
     best_auc_groups = None
@@ -650,7 +681,7 @@ if __name__ == '__main__':
             torch.save(state, os.path.join(args.result_dir, f"model_best_epoch.pth"))
 
             if args.result_dir is not None:
-                np.savez(os.path.join(args.result_dir, f'pred_gt_best_epoch.npz'), 
+                np.savez(os.path.join(args.result_dir, f'pred_gt_best_epoch.npz'),
                             test_pred=test_preds, test_gt=test_gts, test_attr=test_attrs)
 
 #         logger.log(f'---- best val AUC {best_val_auc:.4f} at epoch {best_ep}')
@@ -723,13 +754,13 @@ if __name__ == '__main__':
                 group_disparity_str = ''
                 for i in range(len(best_between_group_disparity)):
                     group_disparity_str += ', '.join([f'{x:.4f}' for x in best_between_group_disparity[i]]) + ', '
-                
+
                 dpd_head_str = ', '.join([f'{x:.4f}' for x in best_dpd_groups]) + ', '
                 eod_head_str = ', '.join([f'{x:.4f}' for x in best_eod_groups]) + ', '
 
                 path_str = f'{args.result_dir}_seed{args.seed}_auc{best_auc:.4f}'
                 f.write(f'{best_ep}, {best_acc:.4f}, {esacc_head_str} {best_auc:.4f}, {esauc_head_str} {auc_head_str} {dpd_head_str} {eod_head_str} {group_disparity_str} {path_str}\n')
-                
+
     best_acc, best_es_acc, best_auc, best_es_auc, best_auc_groups, best_dpd_groups, best_eod_groups, best_between_group_disparity, \
     best_acc_std, best_es_acc_std, best_auc_std, best_es_auc_std, best_auc_groups_std, best_dpd_groups_std, best_eod_groups_std, best_between_group_disparity_std = bootstrap_performance(best_test_preds, best_test_gts, best_test_attrs, num_classes=args.num_classes, bootstrap_repeat_times=args.bootstrap_repeat_times)
     logger.log(f'(mean) best_acc, best_es_acc, best_auc, best_es_auc, best_auc_groups, best_dpd_groups, best_eod_groups, best_between_group_disparity')
